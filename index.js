@@ -51,7 +51,7 @@ const upload = multer({
 // MIDDLEWARE
 // ──────────────────────────────────────────────
 app.use(cors({
-  origin:  origin:[
+  origin:[
     "https://adminpanel.enco.st",
     "https://enco.st",
      "http://adminpanel.enco.st",
