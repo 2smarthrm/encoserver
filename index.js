@@ -1,12 +1,17 @@
-/**
- * ENCO – Painel de Gestão  |  Backend API
- * Express + MongoDB + JWT + ImageKit
- *
- * PUBLIC  routes → no token required (for external website integration)
- * PRIVATE routes → require Bearer JWT token
- *
- * Ficheiros NUNCA guardados no disco — RAM (multer) → ImageKit directo
- */
+/*
+
+quando hospedado em vercel aparece o seguinte erro:
+
+SyntaxError: Unexpected token '<', "<!DOCTYPE "... is not valid JSON
+login.html:407  POST https://encoserver.vercel.app/api 404 (Not Found)
+doLogin @ login.html:407
+onclick @ login.html:319Understand this error
+login.html:422 SyntaxError: Unexpected token '<', "<!DOCTYPE "... is not valid JSON
+
+
+
+*/
+
 
 require('dotenv').config();
 const express             = require('express');
@@ -20,16 +25,16 @@ const { toFile }          = require('@imagekit/nodejs');
 const multer              = require('multer');
 
 const app        = express();
-const PORT       = process.env.PORT       || 4000;
-const JWT_SECRET = process.env.JWT_SECRET || 'enco_super_secret_2025';
+const PORT =  4000;
+const JWT_SECRET = | 'enco_super_secret_2025';
 
 // ──────────────────────────────────────────────
 // IMAGEKIT  (ficheiros vão directamente para a cloud, zero disco local)
 // ──────────────────────────────────────────────
 const imagekit = new ImageKit({
-  publicKey:   process.env.IK_PUBLIC   || 'public_X40KBDYHT8F5/LPw1IJX1s6K62Q=',
-  privateKey:  process.env.IK_PRIVATE  || 'private_jun/amOWn37j6Pf6aboTA1dhgZs=',
-  urlEndpoint: process.env.IK_ENDPOINT || 'https://ik.imagekit.io/fsobpyaa5i',
+  publicKey:   'public_X40KBDYHT8F5/LPw1IJX1s6K62Q=',
+  privateKey:  'private_jun/amOWn37j6Pf6aboTA1dhgZs=',
+  urlEndpoint:  'https://ik.imagekit.io/fsobpyaa5i',
 });
 
 // Multer com memoryStorage — ficheiro fica em RAM, nunca toca o disco
@@ -56,8 +61,7 @@ app.use(express.urlencoded({ extended: true }));
 // ──────────────────────────────────────────────
 // MONGODB
 // ──────────────────────────────────────────────
-const MONGO_URI = process.env.MONGO_URI ||
-  'mongodb+srv://2smarthrm_db_user:JvrSBCpRla7BLxIw@cluster0.yj1qese.mongodb.net/enco_db?retryWrites=true&w=majority';
+const MONGO_URI = 'mongodb+srv://2smarthrm_db_user:JvrSBCpRla7BLxIw@cluster0.yj1qese.mongodb.net/enco_db?retryWrites=true&w=majority';
 
 mongoose.connect(MONGO_URI)
   .then(() => { console.log('✅  MongoDB connected'); seedAdmin(); })
@@ -500,8 +504,6 @@ app.get('/api/health', (_req, res) => {
 // START
 // ══════════════════════════════════════════════
 
-
-/*
 app.listen(PORT, () => {
   console.log(`\n🚀  ENCO API  →  http://localhost:${PORT}\n`);
   console.log(`📋  PÚBLICAS (sem token)`);
@@ -534,5 +536,3 @@ app.listen(PORT, () => {
   console.log(`   GET  /api/admin/upload/auth-token  ← token client-side`);
   console.log(`   DEL  /api/admin/upload/:fileId     ← apagar ficheiro\n`);
 });
-
-*/
