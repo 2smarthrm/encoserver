@@ -51,7 +51,14 @@ const upload = multer({
 // MIDDLEWARE
 // ──────────────────────────────────────────────
 app.use(cors({
-  origin: '*',
+  origin:[
+    "https://adminpanel.enco.st",
+    "https://enco.st",
+     "http://adminpanel.enco.st",
+    "http://enco.st",
+    "http://127.0.0.1:5500/horizontal"
+    "http://127.0.0.1:5500" 
+  ] ,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
