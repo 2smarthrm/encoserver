@@ -26,7 +26,7 @@ const multer              = require('multer');
 
 const app        = express();
 const PORT =  4000;
-const JWT_SECRET = | 'enco_super_secret_2025';
+const JWT_SECRET =  'enco_super_secret_2025';
 
 // ──────────────────────────────────────────────
 // IMAGEKIT  (ficheiros vão directamente para a cloud, zero disco local)
@@ -505,7 +505,7 @@ app.get('/api/health', (_req, res) => {
 // ══════════════════════════════════════════════
 
 app.listen(PORT, () => {
-  console.log(`\n🚀  ENCO API  →  http://localhost:${PORT}\n`);
+  console.log(`\n   ENCO API  →  http://localhost:${PORT}\n`);
   console.log(`📋  PÚBLICAS (sem token)`);
   console.log(`   GET  /api/health`);
   console.log(`   GET  /api/slides`);
@@ -517,7 +517,7 @@ app.listen(PORT, () => {
   console.log(`   GET  /api/posts/:idOrSlug`);
   console.log(`   GET  /api/contact`);
   console.log(`   GET  /api/profile`);
-  console.log(`\n🔐  PRIVADAS (Bearer JWT)`);
+  console.log(`\n   PRIVADAS (Bearer JWT)`);
   console.log(`   POST              /api/auth/login`);
   console.log(`   GET  PUT          /api/auth/me`);
   console.log(`   GET  POST PUT DEL /api/admin/slides`);
@@ -529,7 +529,7 @@ app.listen(PORT, () => {
   console.log(`   PUT               /api/admin/contact`);
   console.log(`   PUT               /api/admin/profile`);
   console.log(`   GET               /api/admin/stats`);
-  console.log(`\n📸  IMAGEKIT (RAM → cloud, zero disco local)`);
+  console.log(`\n   IMAGEKIT (RAM → cloud, zero disco local)`);
   console.log(`   POST /api/admin/upload             ← multipart/form-data`);
   console.log(`   POST /api/admin/upload/url         ← upload por URL remota`);
   console.log(`   GET  /api/admin/upload/files       ← listar ficheiros`);
