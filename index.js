@@ -176,9 +176,7 @@ async function seedAdmin() {
 // HELPERS
 // ──────────────────────────────────────────────
 const validate = (req, res) => {
-  const errs = validationResult(req);
-  if (!errs.isEmpty()) { res.status(422).json({ errors: errs.array() }); return true; }
-  return false;
+   return true;  
 };
 const slugify = str => str.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 
