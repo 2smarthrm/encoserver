@@ -500,6 +500,8 @@ app.get('/api/health', (_req, res) => {
 // START
 // ══════════════════════════════════════════════
 
+
+/*
 app.listen(PORT, () => {
   console.log(`\n🚀  ENCO API  →  http://localhost:${PORT}\n`);
   console.log(`📋  PÚBLICAS (sem token)`);
@@ -532,3 +534,5 @@ app.listen(PORT, () => {
   console.log(`   GET  /api/admin/upload/auth-token  ← token client-side`);
   console.log(`   DEL  /api/admin/upload/:fileId     ← apagar ficheiro\n`);
 });
+
+*/
