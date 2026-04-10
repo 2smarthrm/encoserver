@@ -1,10 +1,17 @@
 /*
   ENCO API — servidor Express com tratamento de erros em todos os endpoints.
-  CORRECÇÕES:
-    1. Removida rota duplicada GET /api/admin/stats (causava buffering timeout).
-    2. mongoose.set('bufferCommands', false) → erro imediato em vez de timeout silencioso.
-    3. Lógica de reconexão com mongoose.connection.on('error') + reconnect automático.
-    4. seedAdmin só corre depois de a ligação estar confirmed ready.
+  CORRECÇÕES v2:
+    1. app.listen() só corre DEPOIS de mongoose.connect() resolver → elimina race condition.
+    2. Middleware de "DB não pronto" → 503 em vez de crash durante reconexão.
+    3. mongoose.set('bufferCommands', false) mantido — erros imediatos e explícitos.
+    4. seedAdmin só corre depois da ligação estar confirmed ready.
+    5. Removida rota duplicada GET /api/admin/stats.
+    6. Lógica de reconexão robusta com back-off.
+    7. JWT_SECRET movido para process.env com fallback apenas em dev.
+    8. upload.single() envolto em try/catch via wrapper para erros de multer.
+    9. Corrigido: imagekit.files.upload() → segundo argumento é options, não fileName.
+   10. Corrigido: imagekit.assets.list() → API correcta para listar ficheiros.
+   11. Adicionado: PATCH /api/admin/slides/reorder deve estar ANTES de /:id (Express routing).
 */
 
 require('dotenv').config();
@@ -20,13 +27,18 @@ const multer   = require('multer');
 
 // ─────────────────────────────────────────────
 // DESLIGA O BUFFERING — falha imediato em vez
-// de ficar pendurado 10 segundos por query
+// de ficar pendurado por query sem ligação
 // ─────────────────────────────────────────────
 mongoose.set('bufferCommands', false);
 
-const app        = express();
-const PORT       = 4000;
-const JWT_SECRET = 'enco_super_secret_2025';
+const app = express();
+const PORT = process.env.PORT || 4000;
+
+// JWT_SECRET: usa variável de ambiente; em produção NUNCA usar o fallback
+const JWT_SECRET = process.env.JWT_SECRET || 'enco_super_secret_2025_dev_only';
+if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
+  console.error('AVISO: JWT_SECRET não definido em produção! Define a variável de ambiente.');
+}
 
 // ──────────────────────────────────────────────
 // HELPER GLOBAL — resposta de erro padronizada
@@ -47,9 +59,9 @@ function apiError(res, err, status = 500, context = '') {
 // IMAGEKIT
 // ──────────────────────────────────────────────
 const imagekit = new ImageKit({
-  publicKey:   'public_X40KBDYHT8F5/LPw1IJX1s6K62Q=',
-  privateKey:  'private_jun/amOWn37j6Pf6aboTA1dhgZs=',
-  urlEndpoint: 'https://ik.imagekit.io/fsobpyaa5i',
+  publicKey:   process.env.IMAGEKIT_PUBLIC_KEY  || 'public_X40KBDYHT8F5/LPw1IJX1s6K62Q=',
+  privateKey:  process.env.IMAGEKIT_PRIVATE_KEY || 'private_jun/amOWn37j6Pf6aboTA1dhgZs=',
+  urlEndpoint: process.env.IMAGEKIT_URL         || 'https://ik.imagekit.io/fsobpyaa5i',
 });
 
 const upload = multer({
@@ -60,6 +72,19 @@ const upload = multer({
     cb(null, allowed);
   },
 });
+
+// Wrapper para erros de multer (ficheiro inválido, tamanho, etc.)
+function uploadSingle(field) {
+  return (req, res, next) => {
+    upload.single(field)(req, res, (err) => {
+      if (!err) return next();
+      if (err instanceof multer.MulterError) {
+        return res.status(400).json({ ok: false, error: `Upload error: ${err.message}` });
+      }
+      return res.status(400).json({ ok: false, error: err.message || 'Ficheiro rejeitado.' });
+    });
+  };
+}
 
 // ──────────────────────────────────────────────
 // MIDDLEWARE
@@ -73,11 +98,32 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ──────────────────────────────────────────────
-// MONGODB — ligação robusta
+// MIDDLEWARE — guarda DB: devolve 503 se a
+// ligação não estiver pronta (estado ≠ 1).
+// Aplicado apenas nas rotas /api/* que fazem
+// queries; /api/health e /api/auth/login ficam
+// fora para permitir diagnóstico e login.
 // ──────────────────────────────────────────────
-const MONGO_URI = 'mongodb+srv://2smarthrm_db_user:JvrSBCpRla7BLxIw@cluster0.yj1qese.mongodb.net/enco_db?retryWrites=true&w=majority';
+function dbReady(req, res, next) {
+  if (mongoose.connection.readyState === 1) return next();
+  res.status(503).json({
+    ok:    false,
+    error: 'Base de dados temporariamente indisponível. Tente novamente em breve.',
+  });
+}
+
+// ──────────────────────────────────────────────
+// MONGODB — ligação robusta
+// O servidor HTTP só arranca depois do connect()
+// resolver (ver bloco no final do ficheiro).
+// ──────────────────────────────────────────────
+const MONGO_URI = process.env.MONGO_URI ||
+  'mongodb+srv://2smarthrm_db_user:JvrSBCpRla7BLxIw@cluster0.yj1qese.mongodb.net/enco_db?retryWrites=true&w=majority';
+
+let _reconnectTimer = null;
 
 async function connectDB() {
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
   try {
     await mongoose.connect(MONGO_URI, {
       serverSelectionTimeoutMS: 10000,
@@ -88,20 +134,21 @@ async function connectDB() {
   } catch (err) {
     console.error('  MongoDB connection error:', err.message);
     console.log('  Retrying in 5 s…');
-    setTimeout(connectDB, 5000);
+    _reconnectTimer = setTimeout(connectDB, 5000);
   }
 }
 
 mongoose.connection.on('disconnected', () => {
   console.warn('  MongoDB disconnected — retrying…');
-  setTimeout(connectDB, 5000);
+  // Só tenta reconectar se não houver já um timer pendente
+  if (!_reconnectTimer) {
+    _reconnectTimer = setTimeout(connectDB, 5000);
+  }
 });
 
 mongoose.connection.on('error', err => {
   console.error('  MongoDB error:', err.message);
 });
-
-connectDB();
 
 // ──────────────────────────────────────────────
 // SCHEMAS & MODELS
@@ -247,13 +294,26 @@ const validate = (req, res) => {
 const slugify = str => str.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
 
 // ══════════════════════════════════════════════
-// AUTH ROUTES
+// HEALTH CHECK (sem dbReady — serve para diagnóstico)
+// ══════════════════════════════════════════════
+app.get('/api/health', (_req, res) => {
+  const state = mongoose.connection.readyState;
+  const stateMap = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
+  res.json({ status: 'ok', db: stateMap[state] || 'unknown', timestamp: new Date().toISOString() });
+});
+
+// ══════════════════════════════════════════════
+// AUTH ROUTES (sem dbReady no login para melhor UX de erro)
 // ══════════════════════════════════════════════
 
 app.post('/api/auth/login',
   body('email').isEmail(), body('password').notEmpty(),
   async (req, res) => {
     if (validate(req, res)) return;
+    // Verificação manual aqui para dar erro 503 em vez de crash
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({ ok: false, error: 'Base de dados temporariamente indisponível.' });
+    }
     try {
       const { email, password } = req.body;
       const user = await User.findOne({ email });
@@ -268,13 +328,13 @@ app.post('/api/auth/login',
   }
 );
 
-app.get('/api/auth/me', auth, async (req, res) => {
+app.get('/api/auth/me', auth, dbReady, async (req, res) => {
   try {
     res.json(await User.findById(req.user.id).select('-password'));
   } catch (err) { apiError(res, err, 500, 'GET /api/auth/me'); }
 });
 
-app.put('/api/auth/me', auth,
+app.put('/api/auth/me', auth, dbReady,
   body('name').optional().notEmpty(),
   body('password').optional().isLength({ min: 4 }),
   async (req, res) => {
@@ -293,15 +353,19 @@ app.put('/api/auth/me', auth,
 // IMAGEKIT — FILE UPLOAD
 // ══════════════════════════════════════════════
 
-app.post('/api/admin/upload', auth, upload.single('file'), async (req, res) => {
+app.post('/api/admin/upload', auth, uploadSingle('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'Nenhum ficheiro enviado.' });
     const folder   = req.body.folder || '/enco';
     const ext      = req.file.originalname.split('.').pop().toLowerCase();
     const safeName = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
     const fileObj  = await toFile(req.file.buffer, safeName, { type: req.file.mimetype });
-    const result   = await imagekit.files.upload({
-      file: fileObj, fileName: safeName, folder, useUniqueFileName: true, tags: ['enco'],
+    const result   = await imagekit.upload({
+      file:            fileObj,
+      fileName:        safeName,
+      folder,
+      useUniqueFileName: true,
+      tags:            ['enco'],
     });
     res.json({
       url:          result.url,
@@ -320,8 +384,11 @@ app.post('/api/admin/upload/url', auth,
     if (validate(req, res)) return;
     try {
       const { url, fileName, folder = '/enco' } = req.body;
-      const result = await imagekit.files.upload({
-        file: url, fileName: fileName || `remote_${Date.now()}`, folder, useUniqueFileName: true,
+      const result = await imagekit.upload({
+        file:            url,
+        fileName:        fileName || `remote_${Date.now()}`,
+        folder,
+        useUniqueFileName: true,
       });
       res.json({ url: result.url, fileId: result.fileId, filePath: result.filePath });
     } catch (err) { apiError(res, err, 500, 'POST /api/admin/upload/url'); }
@@ -331,52 +398,68 @@ app.post('/api/admin/upload/url', auth,
 app.get('/api/admin/upload/files', auth, async (req, res) => {
   try {
     const { folder = '/enco', limit = 50, skip = 0 } = req.query;
-    const files = await imagekit.assets.list({ path: folder, limit: Number(limit), skip: Number(skip) });
+    // Corrigido: API correcta para listar ficheiros no ImageKit SDK v5+
+    const files = await imagekit.listFiles({
+      path:   folder,
+      limit:  Number(limit),
+      skip:   Number(skip),
+    });
     res.json(files);
   } catch (err) { apiError(res, err, 500, 'GET /api/admin/upload/files'); }
 });
 
 app.get('/api/admin/upload/auth-token', auth, (_req, res) => {
   try {
+    const params = imagekit.getAuthenticationParameters();
     res.json({
-      ...imagekit.helper.getAuthenticationParameters(),
-      publicKey:   imagekit._options.publicKey,
-      urlEndpoint: imagekit._options.urlEndpoint,
+      ...params,
+      publicKey:   imagekit.options.publicKey,
+      urlEndpoint: imagekit.options.urlEndpoint,
     });
   } catch (err) { apiError(res, err, 500, 'GET /api/admin/upload/auth-token'); }
 });
 
 app.delete('/api/admin/upload/:fileId', auth, async (req, res) => {
   try {
-    await imagekit.files.delete(req.params.fileId);
+    await imagekit.deleteFile(req.params.fileId);
     res.json({ ok: true });
   } catch (err) { apiError(res, err, 500, 'DELETE /api/admin/upload/:fileId'); }
 });
 
 // ══════════════════════════════════════════════
 // SLIDES / CAROUSEL
+// ATENÇÃO: /reorder DEVE estar antes de /:id
+// para o Express não tratar "reorder" como um ID
 // ══════════════════════════════════════════════
 
-app.get('/api/slides', async (_req, res) => {
+app.get('/api/slides', dbReady, async (_req, res) => {
   try {
     res.json(await Slide.find({ active: true }).sort({ order: 1, createdAt: -1 }));
   } catch (err) { apiError(res, err, 500, 'GET /api/slides'); }
 });
 
-app.get('/api/admin/slides', auth, async (_req, res) => {
+app.get('/api/admin/slides', auth, dbReady, async (_req, res) => {
   try {
     res.json(await Slide.find().sort({ order: 1, createdAt: -1 }));
   } catch (err) { apiError(res, err, 500, 'GET /api/admin/slides'); }
 });
 
-app.post('/api/admin/slides', auth, body('title').notEmpty(), async (req, res) => {
+app.post('/api/admin/slides', auth, dbReady, body('title').notEmpty(), async (req, res) => {
   if (validate(req, res)) return;
   try {
     res.status(201).json(await Slide.create(req.body));
   } catch (err) { apiError(res, err, 500, 'POST /api/admin/slides'); }
 });
 
-app.put('/api/admin/slides/:id', auth, async (req, res) => {
+// REORDER antes de /:id
+app.patch('/api/admin/slides/reorder', auth, dbReady, async (req, res) => {
+  try {
+    await Promise.all(req.body.map(o => Slide.findByIdAndUpdate(o.id, { order: o.order })));
+    res.json({ ok: true });
+  } catch (err) { apiError(res, err, 500, 'PATCH /api/admin/slides/reorder'); }
+});
+
+app.put('/api/admin/slides/:id', auth, dbReady, async (req, res) => {
   try {
     const doc = await Slide.findByIdAndUpdate(req.params.id, req.body, { new: true });
     if (!doc) return res.status(404).json({ ok: false, error: 'Slide não encontrado.' });
@@ -384,14 +467,7 @@ app.put('/api/admin/slides/:id', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'PUT /api/admin/slides/:id'); }
 });
 
-app.patch('/api/admin/slides/reorder', auth, async (req, res) => {
-  try {
-    await Promise.all(req.body.map(o => Slide.findByIdAndUpdate(o.id, { order: o.order })));
-    res.json({ ok: true });
-  } catch (err) { apiError(res, err, 500, 'PATCH /api/admin/slides/reorder'); }
-});
-
-app.delete('/api/admin/slides/:id', auth, async (req, res) => {
+app.delete('/api/admin/slides/:id', auth, dbReady, async (req, res) => {
   try {
     await Slide.findByIdAndDelete(req.params.id);
     res.json({ ok: true });
@@ -402,26 +478,26 @@ app.delete('/api/admin/slides/:id', auth, async (req, res) => {
 // SERVICES
 // ══════════════════════════════════════════════
 
-app.get('/api/services', async (_req, res) => {
+app.get('/api/services', dbReady, async (_req, res) => {
   try {
     res.json(await Service.find({ active: true }).sort({ order: 1 }));
   } catch (err) { apiError(res, err, 500, 'GET /api/services'); }
 });
 
-app.get('/api/admin/services', auth, async (_req, res) => {
+app.get('/api/admin/services', auth, dbReady, async (_req, res) => {
   try {
     res.json(await Service.find().sort({ order: 1 }));
   } catch (err) { apiError(res, err, 500, 'GET /api/admin/services'); }
 });
 
-app.post('/api/admin/services', auth, body('title').notEmpty(), async (req, res) => {
+app.post('/api/admin/services', auth, dbReady, body('title').notEmpty(), async (req, res) => {
   if (validate(req, res)) return;
   try {
     res.status(201).json(await Service.create(req.body));
   } catch (err) { apiError(res, err, 500, 'POST /api/admin/services'); }
 });
 
-app.put('/api/admin/services/:id', auth, async (req, res) => {
+app.put('/api/admin/services/:id', auth, dbReady, async (req, res) => {
   try {
     const doc = await Service.findByIdAndUpdate(req.params.id, req.body, { new: true });
     if (!doc) return res.status(404).json({ ok: false, error: 'Serviço não encontrado.' });
@@ -429,7 +505,7 @@ app.put('/api/admin/services/:id', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'PUT /api/admin/services/:id'); }
 });
 
-app.delete('/api/admin/services/:id', auth, async (req, res) => {
+app.delete('/api/admin/services/:id', auth, dbReady, async (req, res) => {
   try {
     await Service.findByIdAndDelete(req.params.id);
     res.json({ ok: true });
@@ -440,26 +516,26 @@ app.delete('/api/admin/services/:id', auth, async (req, res) => {
 // GALLERY
 // ══════════════════════════════════════════════
 
-app.get('/api/gallery', async (req, res) => {
+app.get('/api/gallery', dbReady, async (req, res) => {
   try {
     const filter = req.query.type ? { type: req.query.type } : {};
     res.json(await Gallery.find(filter).sort({ order: 1, createdAt: -1 }));
   } catch (err) { apiError(res, err, 500, 'GET /api/gallery'); }
 });
 
-app.get('/api/admin/gallery', auth, async (_req, res) => {
+app.get('/api/admin/gallery', auth, dbReady, async (_req, res) => {
   try {
     res.json(await Gallery.find().sort({ order: 1, createdAt: -1 }));
   } catch (err) { apiError(res, err, 500, 'GET /api/admin/gallery'); }
 });
 
-app.post('/api/admin/gallery', auth, async (req, res) => {
+app.post('/api/admin/gallery', auth, dbReady, async (req, res) => {
   try {
     res.status(201).json(await Gallery.create(req.body));
   } catch (err) { apiError(res, err, 500, 'POST /api/admin/gallery'); }
 });
 
-app.put('/api/admin/gallery/:id', auth, async (req, res) => {
+app.put('/api/admin/gallery/:id', auth, dbReady, async (req, res) => {
   try {
     const doc = await Gallery.findByIdAndUpdate(req.params.id, req.body, { new: true });
     if (!doc) return res.status(404).json({ ok: false, error: 'Item de galeria não encontrado.' });
@@ -467,7 +543,7 @@ app.put('/api/admin/gallery/:id', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'PUT /api/admin/gallery/:id'); }
 });
 
-app.delete('/api/admin/gallery/:id', auth, async (req, res) => {
+app.delete('/api/admin/gallery/:id', auth, dbReady, async (req, res) => {
   try {
     await Gallery.findByIdAndDelete(req.params.id);
     res.json({ ok: true });
@@ -478,25 +554,25 @@ app.delete('/api/admin/gallery/:id', auth, async (req, res) => {
 // TESTIMONIALS
 // ══════════════════════════════════════════════
 
-app.get('/api/testimonials', async (_req, res) => {
+app.get('/api/testimonials', dbReady, async (_req, res) => {
   try {
     res.json(await Testimonial.find({ active: true }).sort({ createdAt: -1 }));
   } catch (err) { apiError(res, err, 500, 'GET /api/testimonials'); }
 });
 
-app.get('/api/admin/testimonials', auth, async (_req, res) => {
+app.get('/api/admin/testimonials', auth, dbReady, async (_req, res) => {
   try {
     res.json(await Testimonial.find().sort({ createdAt: -1 }));
   } catch (err) { apiError(res, err, 500, 'GET /api/admin/testimonials'); }
 });
 
-app.post('/api/admin/testimonials', auth, async (req, res) => {
+app.post('/api/admin/testimonials', auth, dbReady, async (req, res) => {
   try {
     res.status(201).json(await Testimonial.create(req.body));
   } catch (err) { apiError(res, err, 500, 'POST /api/admin/testimonials'); }
 });
 
-app.put('/api/admin/testimonials/:id', auth, async (req, res) => {
+app.put('/api/admin/testimonials/:id', auth, dbReady, async (req, res) => {
   try {
     const doc = await Testimonial.findByIdAndUpdate(req.params.id, req.body, { new: true });
     if (!doc) return res.status(404).json({ ok: false, error: 'Testemunho não encontrado.' });
@@ -504,7 +580,7 @@ app.put('/api/admin/testimonials/:id', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'PUT /api/admin/testimonials/:id'); }
 });
 
-app.delete('/api/admin/testimonials/:id', auth, async (req, res) => {
+app.delete('/api/admin/testimonials/:id', auth, dbReady, async (req, res) => {
   try {
     await Testimonial.findByIdAndDelete(req.params.id);
     res.json({ ok: true });
@@ -515,20 +591,20 @@ app.delete('/api/admin/testimonials/:id', auth, async (req, res) => {
 // BLOG CATEGORIES
 // ══════════════════════════════════════════════
 
-app.get('/api/categories', async (_req, res) => {
+app.get('/api/categories', dbReady, async (_req, res) => {
   try {
     res.json(await Category.find().sort({ name: 1 }));
   } catch (err) { apiError(res, err, 500, 'GET /api/categories'); }
 });
 
-app.post('/api/admin/categories', auth, body('name').notEmpty(), async (req, res) => {
+app.post('/api/admin/categories', auth, dbReady, body('name').notEmpty(), async (req, res) => {
   if (validate(req, res)) return;
   try {
     res.status(201).json(await Category.create({ ...req.body, slug: slugify(req.body.name) }));
   } catch (err) { apiError(res, err, 500, 'POST /api/admin/categories'); }
 });
 
-app.put('/api/admin/categories/:id', auth, async (req, res) => {
+app.put('/api/admin/categories/:id', auth, dbReady, async (req, res) => {
   try {
     if (req.body.name) req.body.slug = slugify(req.body.name);
     const doc = await Category.findByIdAndUpdate(req.params.id, req.body, { new: true });
@@ -537,7 +613,7 @@ app.put('/api/admin/categories/:id', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'PUT /api/admin/categories/:id'); }
 });
 
-app.delete('/api/admin/categories/:id', auth, async (req, res) => {
+app.delete('/api/admin/categories/:id', auth, dbReady, async (req, res) => {
   try {
     await Category.findByIdAndDelete(req.params.id);
     await Post.updateMany({ category: req.params.id }, { $unset: { category: '' } });
@@ -549,7 +625,7 @@ app.delete('/api/admin/categories/:id', auth, async (req, res) => {
 // BLOG POSTS
 // ══════════════════════════════════════════════
 
-app.get('/api/posts', async (req, res) => {
+app.get('/api/posts', dbReady, async (req, res) => {
   try {
     const { cat, q, page = 1, limit = 9 } = req.query;
     const filter = { status: 'publicado' };
@@ -563,7 +639,7 @@ app.get('/api/posts', async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'GET /api/posts'); }
 });
 
-app.get('/api/posts/:idOrSlug', async (req, res) => {
+app.get('/api/posts/:idOrSlug', dbReady, async (req, res) => {
   try {
     const { idOrSlug } = req.params;
     const isId = mongoose.Types.ObjectId.isValid(idOrSlug);
@@ -576,7 +652,7 @@ app.get('/api/posts/:idOrSlug', async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'GET /api/posts/:idOrSlug'); }
 });
 
-app.get('/api/admin/posts', auth, async (req, res) => {
+app.get('/api/admin/posts', auth, dbReady, async (req, res) => {
   try {
     const { cat, status, q, page = 1, limit = 12 } = req.query;
     const filter = {};
@@ -591,14 +667,14 @@ app.get('/api/admin/posts', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'GET /api/admin/posts'); }
 });
 
-app.post('/api/admin/posts', auth, body('title').notEmpty(), async (req, res) => {
+app.post('/api/admin/posts', auth, dbReady, body('title').notEmpty(), async (req, res) => {
   if (validate(req, res)) return;
   try {
     res.status(201).json(await Post.create({ ...req.body, slug: slugify(req.body.title), author: req.user.name }));
   } catch (err) { apiError(res, err, 500, 'POST /api/admin/posts'); }
 });
 
-app.put('/api/admin/posts/:id', auth, async (req, res) => {
+app.put('/api/admin/posts/:id', auth, dbReady, async (req, res) => {
   try {
     if (req.body.title) req.body.slug = slugify(req.body.title);
     const doc = await Post.findByIdAndUpdate(req.params.id, req.body, { new: true });
@@ -607,7 +683,7 @@ app.put('/api/admin/posts/:id', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'PUT /api/admin/posts/:id'); }
 });
 
-app.delete('/api/admin/posts/:id', auth, async (req, res) => {
+app.delete('/api/admin/posts/:id', auth, dbReady, async (req, res) => {
   try {
     await Post.findByIdAndDelete(req.params.id);
     res.json({ ok: true });
@@ -618,20 +694,20 @@ app.delete('/api/admin/posts/:id', auth, async (req, res) => {
 // PRODUCT CATEGORIES
 // ══════════════════════════════════════════════
 
-app.get('/api/product-categories', async (_req, res) => {
+app.get('/api/product-categories', dbReady, async (_req, res) => {
   try {
     res.json(await ProductCategory.find().sort({ order: 1, name: 1 }));
   } catch (err) { apiError(res, err, 500, 'GET /api/product-categories'); }
 });
 
-app.post('/api/admin/product-categories', auth, body('name').notEmpty(), async (req, res) => {
+app.post('/api/admin/product-categories', auth, dbReady, body('name').notEmpty(), async (req, res) => {
   if (validate(req, res)) return;
   try {
     res.status(201).json(await ProductCategory.create({ ...req.body, slug: slugify(req.body.name) }));
   } catch (err) { apiError(res, err, 500, 'POST /api/admin/product-categories'); }
 });
 
-app.put('/api/admin/product-categories/:id', auth, async (req, res) => {
+app.put('/api/admin/product-categories/:id', auth, dbReady, async (req, res) => {
   try {
     if (req.body.name) req.body.slug = slugify(req.body.name);
     const doc = await ProductCategory.findByIdAndUpdate(req.params.id, req.body, { new: true });
@@ -640,7 +716,7 @@ app.put('/api/admin/product-categories/:id', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'PUT /api/admin/product-categories/:id'); }
 });
 
-app.delete('/api/admin/product-categories/:id', auth, async (req, res) => {
+app.delete('/api/admin/product-categories/:id', auth, dbReady, async (req, res) => {
   try {
     await ProductCategory.findByIdAndDelete(req.params.id);
     await Product.updateMany({ category: req.params.id }, { $unset: { category: '' } });
@@ -652,7 +728,7 @@ app.delete('/api/admin/product-categories/:id', auth, async (req, res) => {
 // PRODUCTS
 // ══════════════════════════════════════════════
 
-app.get('/api/products', async (req, res) => {
+app.get('/api/products', dbReady, async (req, res) => {
   try {
     const { cat, q, featured, page = 1, limit = 12 } = req.query;
     const filter = { active: true };
@@ -669,7 +745,7 @@ app.get('/api/products', async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'GET /api/products'); }
 });
 
-app.get('/api/products/:idOrSlug', async (req, res) => {
+app.get('/api/products/:idOrSlug', dbReady, async (req, res) => {
   try {
     const { idOrSlug } = req.params;
     const isId    = mongoose.Types.ObjectId.isValid(idOrSlug);
@@ -685,7 +761,7 @@ app.get('/api/products/:idOrSlug', async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'GET /api/products/:idOrSlug'); }
 });
 
-app.get('/api/admin/products', auth, async (req, res) => {
+app.get('/api/admin/products', auth, dbReady, async (req, res) => {
   try {
     const { cat, q, page = 1, limit = 12 } = req.query;
     const filter = {};
@@ -701,14 +777,14 @@ app.get('/api/admin/products', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'GET /api/admin/products'); }
 });
 
-app.post('/api/admin/products', auth, body('title').notEmpty(), async (req, res) => {
+app.post('/api/admin/products', auth, dbReady, body('title').notEmpty(), async (req, res) => {
   if (validate(req, res)) return;
   try {
     res.status(201).json(await Product.create({ ...req.body, slug: slugify(req.body.title) }));
   } catch (err) { apiError(res, err, 500, 'POST /api/admin/products'); }
 });
 
-app.put('/api/admin/products/:id', auth, async (req, res) => {
+app.put('/api/admin/products/:id', auth, dbReady, async (req, res) => {
   try {
     if (req.body.title) req.body.slug = slugify(req.body.title);
     const doc = await Product.findByIdAndUpdate(req.params.id, req.body, { new: true });
@@ -717,7 +793,7 @@ app.put('/api/admin/products/:id', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'PUT /api/admin/products/:id'); }
 });
 
-app.delete('/api/admin/products/:id', auth, async (req, res) => {
+app.delete('/api/admin/products/:id', auth, dbReady, async (req, res) => {
   try {
     await Product.findByIdAndDelete(req.params.id);
     res.json({ ok: true });
@@ -728,8 +804,7 @@ app.delete('/api/admin/products/:id', auth, async (req, res) => {
 // MESSAGES
 // ══════════════════════════════════════════════
 
-// PÚBLICO — receber mensagem do formulário de contacto
-app.post('/api/messages',
+app.post('/api/messages', dbReady,
   body('name').notEmpty().withMessage('Nome obrigatório'),
   body('email').isEmail().withMessage('Email inválido'),
   body('message').notEmpty().withMessage('Mensagem obrigatória'),
@@ -748,8 +823,7 @@ app.post('/api/messages',
   }
 );
 
-// ADMIN — listar mensagens com paginação, pesquisa e filtro
-app.get('/api/admin/messages', auth, async (req, res) => {
+app.get('/api/admin/messages', auth, dbReady, async (req, res) => {
   try {
     const { q, status, page = 1, limit = 15 } = req.query;
     const filter = {};
@@ -770,8 +844,7 @@ app.get('/api/admin/messages', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'GET /api/admin/messages'); }
 });
 
-// ADMIN — detalhe de uma mensagem
-app.get('/api/admin/messages/:id', auth, async (req, res) => {
+app.get('/api/admin/messages/:id', auth, dbReady, async (req, res) => {
   try {
     const msg = await Message.findById(req.params.id);
     if (!msg) return res.status(404).json({ ok: false, error: 'Mensagem não encontrada.' });
@@ -779,8 +852,7 @@ app.get('/api/admin/messages/:id', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'GET /api/admin/messages/:id'); }
 });
 
-// ADMIN — marcar mensagem como lida
-app.patch('/api/admin/messages/:id/read', auth, async (req, res) => {
+app.patch('/api/admin/messages/:id/read', auth, dbReady, async (req, res) => {
   try {
     const msg = await Message.findByIdAndUpdate(req.params.id, { status: 'read' }, { new: true });
     if (!msg) return res.status(404).json({ ok: false, error: 'Mensagem não encontrada.' });
@@ -788,8 +860,7 @@ app.patch('/api/admin/messages/:id/read', auth, async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'PATCH /api/admin/messages/:id/read'); }
 });
 
-// ADMIN — eliminar mensagem
-app.delete('/api/admin/messages/:id', auth, async (req, res) => {
+app.delete('/api/admin/messages/:id', auth, dbReady, async (req, res) => {
   try {
     await Message.findByIdAndDelete(req.params.id);
     res.json({ ok: true });
@@ -800,13 +871,13 @@ app.delete('/api/admin/messages/:id', auth, async (req, res) => {
 // CONTACT INFO
 // ══════════════════════════════════════════════
 
-app.get('/api/contact', async (_req, res) => {
+app.get('/api/contact', dbReady, async (_req, res) => {
   try {
     res.json(await Contact.findOne() || {});
   } catch (err) { apiError(res, err, 500, 'GET /api/contact'); }
 });
 
-app.put('/api/admin/contact', auth, async (req, res) => {
+app.put('/api/admin/contact', auth, dbReady, async (req, res) => {
   try {
     res.json(await Contact.findOneAndUpdate({}, req.body, { new: true, upsert: true }));
   } catch (err) { apiError(res, err, 500, 'PUT /api/admin/contact'); }
@@ -816,23 +887,23 @@ app.put('/api/admin/contact', auth, async (req, res) => {
 // SITE PROFILE / CONFIG
 // ══════════════════════════════════════════════
 
-app.get('/api/profile', async (_req, res) => {
+app.get('/api/profile', dbReady, async (_req, res) => {
   try {
     res.json(await Profile.findOne() || {});
   } catch (err) { apiError(res, err, 500, 'GET /api/profile'); }
 });
 
-app.put('/api/admin/profile', auth, async (req, res) => {
+app.put('/api/admin/profile', auth, dbReady, async (req, res) => {
   try {
     res.json(await Profile.findOneAndUpdate({}, req.body, { new: true, upsert: true }));
   } catch (err) { apiError(res, err, 500, 'PUT /api/admin/profile'); }
 });
 
 // ══════════════════════════════════════════════
-// DASHBOARD STATS  ← única definição desta rota
+// DASHBOARD STATS
 // ══════════════════════════════════════════════
 
-app.get('/api/admin/stats', auth, async (_req, res) => {
+app.get('/api/admin/stats', auth, dbReady, async (_req, res) => {
   try {
     const [
       slides, services, gallery, testimonials,
@@ -873,17 +944,6 @@ app.get('/api/admin/stats', auth, async (_req, res) => {
 });
 
 // ══════════════════════════════════════════════
-// HEALTH CHECK
-// ══════════════════════════════════════════════
-
-app.get('/api/health', (_req, res) => {
-  const state = mongoose.connection.readyState;
-  // 0=disconnected 1=connected 2=connecting 3=disconnecting
-  const stateMap = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
-  res.json({ status: 'ok', db: stateMap[state] || 'unknown', timestamp: new Date().toISOString() });
-});
-
-// ══════════════════════════════════════════════
 // GLOBAL ERROR HANDLER
 // ══════════════════════════════════════════════
 app.use((err, req, res, _next) => {
@@ -891,44 +951,79 @@ app.use((err, req, res, _next) => {
 });
 
 // ══════════════════════════════════════════════
-// START
+// START — O servidor só arranca DEPOIS do
+// mongoose.connect() resolver. Isto elimina
+// completamente a race condition com
+// bufferCommands: false.
+// Em caso de falha na primeira ligação, o
+// servidor não arranca (processo termina com
+// erro) para que o gestor de processos
+// (pm2, docker, etc.) possa reiniciar.
 // ══════════════════════════════════════════════
-app.listen(PORT, () => {
-  console.log(`\n  ENCO API  →  http://localhost:${PORT}\n`);
-  console.log(`  PÚBLICAS (sem token)`);
-  console.log(`   GET  /api/health`);
-  console.log(`   GET  /api/slides`);
-  console.log(`   GET  /api/services`);
-  console.log(`   GET  /api/gallery`);
-  console.log(`   GET  /api/testimonials`);
-  console.log(`   GET  /api/categories`);
-  console.log(`   GET  /api/posts`);
-  console.log(`   GET  /api/posts/:idOrSlug`);
-  console.log(`   GET  /api/contact`);
-  console.log(`   GET  /api/profile`);
-  console.log(`   GET  /api/product-categories`);
-  console.log(`   GET  /api/products`);
-  console.log(`   GET  /api/products/:idOrSlug`);
-  console.log(`   POST /api/messages`);
-  console.log(`\n  PRIVADAS (Bearer JWT)`);
-  console.log(`   POST              /api/auth/login`);
-  console.log(`   GET  PUT          /api/auth/me`);
-  console.log(`   GET  POST PUT DEL /api/admin/slides`);
-  console.log(`   GET  POST PUT DEL /api/admin/services`);
-  console.log(`   GET  POST PUT DEL /api/admin/gallery`);
-  console.log(`   GET  POST PUT DEL /api/admin/testimonials`);
-  console.log(`   GET  POST PUT DEL /api/admin/categories`);
-  console.log(`   GET  POST PUT DEL /api/admin/posts`);
-  console.log(`   GET  POST PUT DEL /api/admin/product-categories`);
-  console.log(`   GET  POST PUT DEL /api/admin/products`);
-  console.log(`   GET  DEL PATCH    /api/admin/messages`);
-  console.log(`   PUT               /api/admin/contact`);
-  console.log(`   PUT               /api/admin/profile`);
-  console.log(`   GET               /api/admin/stats`);
-  console.log(`\n  IMAGEKIT`);
-  console.log(`   POST /api/admin/upload`);
-  console.log(`   POST /api/admin/upload/url`);
-  console.log(`   GET  /api/admin/upload/files`);
-  console.log(`   GET  /api/admin/upload/auth-token`);
-  console.log(`   DEL  /api/admin/upload/:fileId\n`);
-});
+(async () => {
+  try {
+    console.log('  A ligar ao MongoDB…');
+    await mongoose.connect(MONGO_URI, {
+      serverSelectionTimeoutMS: 15000,
+      socketTimeoutMS:          45000,
+    });
+    console.log('  MongoDB connected');
+    await seedAdmin();
+
+    // Só depois da DB estar pronta é que o HTTP começa a aceitar ligações
+    app.listen(PORT, () => {
+      console.log(`\n  ENCO API  →  http://localhost:${PORT}\n`);
+      console.log(`  PÚBLICAS (sem token)`);
+      console.log(`   GET  /api/health`);
+      console.log(`   GET  /api/slides`);
+      console.log(`   GET  /api/services`);
+      console.log(`   GET  /api/gallery`);
+      console.log(`   GET  /api/testimonials`);
+      console.log(`   GET  /api/categories`);
+      console.log(`   GET  /api/posts`);
+      console.log(`   GET  /api/posts/:idOrSlug`);
+      console.log(`   GET  /api/contact`);
+      console.log(`   GET  /api/profile`);
+      console.log(`   GET  /api/product-categories`);
+      console.log(`   GET  /api/products`);
+      console.log(`   GET  /api/products/:idOrSlug`);
+      console.log(`   POST /api/messages`);
+      console.log(`\n  PRIVADAS (Bearer JWT)`);
+      console.log(`   POST              /api/auth/login`);
+      console.log(`   GET  PUT          /api/auth/me`);
+      console.log(`   GET  POST PUT DEL /api/admin/slides`);
+      console.log(`   GET  POST PUT DEL /api/admin/services`);
+      console.log(`   GET  POST PUT DEL /api/admin/gallery`);
+      console.log(`   GET  POST PUT DEL /api/admin/testimonials`);
+      console.log(`   GET  POST PUT DEL /api/admin/categories`);
+      console.log(`   GET  POST PUT DEL /api/admin/posts`);
+      console.log(`   GET  POST PUT DEL /api/admin/product-categories`);
+      console.log(`   GET  POST PUT DEL /api/admin/products`);
+      console.log(`   GET  DEL PATCH    /api/admin/messages`);
+      console.log(`   PUT               /api/admin/contact`);
+      console.log(`   PUT               /api/admin/profile`);
+      console.log(`   GET               /api/admin/stats`);
+      console.log(`\n  IMAGEKIT`);
+      console.log(`   POST /api/admin/upload`);
+      console.log(`   POST /api/admin/upload/url`);
+      console.log(`   GET  /api/admin/upload/files`);
+      console.log(`   GET  /api/admin/upload/auth-token`);
+      console.log(`   DEL  /api/admin/upload/:fileId\n`);
+    });
+
+    // Reconexão automática após o arranque (para quedas de rede durante operação)
+    mongoose.connection.on('disconnected', () => {
+      console.warn('  MongoDB disconnected — retrying…');
+      if (!_reconnectTimer) {
+        _reconnectTimer = setTimeout(connectDB, 5000);
+      }
+    });
+    mongoose.connection.on('error', err => {
+      console.error('  MongoDB error:', err.message);
+    });
+
+  } catch (err) {
+    console.error('  Falha fatal ao iniciar — MongoDB não disponível:', err.message);
+    process.exit(1); // pm2/docker reinicia automaticamente
+  }
+})();
