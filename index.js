@@ -1,18 +1,28 @@
 /*
   ENCO API — servidor Express com tratamento de erros em todos os endpoints.
-  Em vez de crashar, cada endpoint devolve JSON estruturado com o erro.
+  CORRECÇÕES:
+    1. Removida rota duplicada GET /api/admin/stats (causava buffering timeout).
+    2. mongoose.set('bufferCommands', false) → erro imediato em vez de timeout silencioso.
+    3. Lógica de reconexão com mongoose.connection.on('error') + reconnect automático.
+    4. seedAdmin só corre depois de a ligação estar confirmed ready.
 */
 
 require('dotenv').config();
-const express             = require('express');
-const mongoose            = require('mongoose');
-const bcrypt              = require('bcryptjs');
-const jwt                 = require('jsonwebtoken');
-const cors                = require('cors');
+const express  = require('express');
+const mongoose = require('mongoose');
+const bcrypt   = require('bcryptjs');
+const jwt      = require('jsonwebtoken');
+const cors     = require('cors');
 const { body, validationResult } = require('express-validator');
-const ImageKit            = require('@imagekit/nodejs');
-const { toFile }          = require('@imagekit/nodejs');
-const multer              = require('multer');
+const ImageKit = require('@imagekit/nodejs');
+const { toFile } = require('@imagekit/nodejs');
+const multer   = require('multer');
+
+// ─────────────────────────────────────────────
+// DESLIGA O BUFFERING — falha imediato em vez
+// de ficar pendurado 10 segundos por query
+// ─────────────────────────────────────────────
+mongoose.set('bufferCommands', false);
 
 const app        = express();
 const PORT       = 4000;
@@ -63,13 +73,35 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ──────────────────────────────────────────────
-// MONGODB
+// MONGODB — ligação robusta
 // ──────────────────────────────────────────────
 const MONGO_URI = 'mongodb+srv://2smarthrm_db_user:JvrSBCpRla7BLxIw@cluster0.yj1qese.mongodb.net/enco_db?retryWrites=true&w=majority';
 
-mongoose.connect(MONGO_URI)
-  .then(() => { console.log(' MongoDB connected'); seedAdmin(); })
-  .catch(err => console.error('  MongoDB error:', err.message));
+async function connectDB() {
+  try {
+    await mongoose.connect(MONGO_URI, {
+      serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS:          45000,
+    });
+    console.log('  MongoDB connected');
+    await seedAdmin();
+  } catch (err) {
+    console.error('  MongoDB connection error:', err.message);
+    console.log('  Retrying in 5 s…');
+    setTimeout(connectDB, 5000);
+  }
+}
+
+mongoose.connection.on('disconnected', () => {
+  console.warn('  MongoDB disconnected — retrying…');
+  setTimeout(connectDB, 5000);
+});
+
+mongoose.connection.on('error', err => {
+  console.error('  MongoDB error:', err.message);
+});
+
+connectDB();
 
 // ──────────────────────────────────────────────
 // SCHEMAS & MODELS
@@ -143,9 +175,6 @@ const profileSchema = new mongoose.Schema({
 }, { timestamps: true });
 const Profile = mongoose.model('Profile', profileSchema);
 
-// ──────────────────────────────────────────────
-// PRODUCT SCHEMA — NOVO
-// ──────────────────────────────────────────────
 const productCategorySchema = new mongoose.Schema({
   name:  { type: String, required: true },
   slug:  String,
@@ -154,19 +183,29 @@ const productCategorySchema = new mongoose.Schema({
 const ProductCategory = mongoose.model('ProductCategory', productCategorySchema);
 
 const productSchema = new mongoose.Schema({
-  title:       { type: String, required: true },
-  slug:        String,
-  shortDesc:   String,
-  html:        String,
-  image:       String,
-  images:      [String],
-  category:    { type: mongoose.Schema.Types.ObjectId, ref: 'ProductCategory' },
-  featured:    { type: Boolean, default: false },
-  active:      { type: Boolean, default: true },
-  order:       { type: Number, default: 0 },
-  tags:        [String],
+  title:     { type: String, required: true },
+  slug:      String,
+  shortDesc: String,
+  html:      String,
+  image:     String,
+  images:    [String],
+  category:  { type: mongoose.Schema.Types.ObjectId, ref: 'ProductCategory' },
+  featured:  { type: Boolean, default: false },
+  active:    { type: Boolean, default: true },
+  order:     { type: Number, default: 0 },
+  tags:      [String],
 }, { timestamps: true });
 const Product = mongoose.model('Product', productSchema);
+
+const messageSchema = new mongoose.Schema({
+  name:    { type: String, required: true },
+  email:   { type: String, required: true },
+  phone:   { type: String },
+  subject: { type: String },
+  message: { type: String, required: true },
+  status:  { type: String, enum: ['unread', 'read'], default: 'unread' },
+}, { timestamps: true });
+const Message = mongoose.model('Message', messageSchema);
 
 // ──────────────────────────────────────────────
 // AUTH MIDDLEWARE
@@ -182,123 +221,6 @@ function auth(req, res, next) {
     res.status(401).json({ ok: false, error: 'Token inválido ou expirado.', detail: err.message });
   }
 }
-
-// ═══════════════════════════════════════════════
-// PATCH DO SERVIDOR — Adicionar ao server.js existente
-// ═══════════════════════════════════════════════
-
-// ── PASSO 1: Adicionar o Schema de Mensagens (após os outros schemas) ──
-
-const messageSchema = new mongoose.Schema({
-  name:    { type: String, required: true },
-  email:   { type: String, required: true },
-  phone:   { type: String },
-  subject: { type: String },
-  message: { type: String, required: true },
-  status:  { type: String, enum: ['unread', 'read'], default: 'unread' },
-}, { timestamps: true });
-const Message = mongoose.model('Message', messageSchema);
-
-
-// ── PASSO 2: Adicionar os endpoints (após os endpoints de Contact) ──
-
-// PÚBLICO — receber mensagem do formulário de contacto
-app.post('/api/messages',
-  body('name').notEmpty().withMessage('Nome obrigatório'),
-  body('email').isEmail().withMessage('Email inválido'),
-  body('message').notEmpty().withMessage('Mensagem obrigatória'),
-  async (req, res) => {
-    if (validate(req, res)) return;
-    try {
-      const msg = await Message.create({
-        name:    req.body.name,
-        email:   req.body.email,
-        phone:   req.body.phone || '',
-        subject: req.body.subject || '',
-        message: req.body.message,
-      });
-      res.status(201).json({ ok: true, id: msg._id });
-    } catch (err) { apiError(res, err, 500, 'POST /api/messages'); }
-  }
-);
-
-// ADMIN — listar mensagens com paginação, pesquisa e filtro
-app.get('/api/admin/messages', auth, async (req, res) => {
-  try {
-    const { q, status, page = 1, limit = 15 } = req.query;
-    const filter = {};
-    if (status === 'unread' || status === 'read') filter.status = status;
-    if (q) filter.$or = [
-      { name:    { $regex: q, $options: 'i' } },
-      { email:   { $regex: q, $options: 'i' } },
-      { subject: { $regex: q, $options: 'i' } },
-      { message: { $regex: q, $options: 'i' } },
-    ];
-    const total    = await Message.countDocuments(filter);
-    const unread   = await Message.countDocuments({ status: 'unread' });
-    const messages = await Message.find(filter)
-      .sort({ createdAt: -1 })
-      .skip((Number(page) - 1) * Number(limit))
-      .limit(Number(limit));
-    res.json({ messages, total, unread, page: Number(page), pages: Math.ceil(total / Number(limit)) });
-  } catch (err) { apiError(res, err, 500, 'GET /api/admin/messages'); }
-});
-
-// ADMIN — detalhe de uma mensagem
-app.get('/api/admin/messages/:id', auth, async (req, res) => {
-  try {
-    const msg = await Message.findById(req.params.id);
-    if (!msg) return res.status(404).json({ ok: false, error: 'Mensagem não encontrada.' });
-    res.json(msg);
-  } catch (err) { apiError(res, err, 500, 'GET /api/admin/messages/:id'); }
-});
-
-// ADMIN — marcar mensagem como lida
-app.patch('/api/admin/messages/:id/read', auth, async (req, res) => {
-  try {
-    const msg = await Message.findByIdAndUpdate(req.params.id, { status: 'read' }, { new: true });
-    if (!msg) return res.status(404).json({ ok: false, error: 'Mensagem não encontrada.' });
-    res.json({ ok: true });
-  } catch (err) { apiError(res, err, 500, 'PATCH /api/admin/messages/:id/read'); }
-});
-
-// ADMIN — eliminar mensagem (NUNCA criar via admin)
-app.delete('/api/admin/messages/:id', auth, async (req, res) => {
-  try {
-    await Message.findByIdAndDelete(req.params.id);
-    res.json({ ok: true });
-  } catch (err) { apiError(res, err, 500, 'DELETE /api/admin/messages/:id'); }
-});
-
-
-// ── PASSO 3: Atualizar GET /api/admin/stats ──
-// No Promise.all existente, adicionar:
-//   Message.countDocuments(),
-//   Message.countDocuments({ status: 'unread' }),
-//
-// E no res.json, adicionar:
-//   messages, unreadMessages
-//
-// Exemplo do bloco stats completo:
-app.get('/api/admin/stats', auth, async (_req, res) => {
-  try {
-    const [slides, services, gallery, testimonials, posts, categories, products, productCategories, messages, unreadMessages] = await Promise.all([
-      Slide.countDocuments(), Service.countDocuments(), Gallery.countDocuments(),
-      Testimonial.countDocuments(), Post.countDocuments(), Category.countDocuments(),
-      Product.countDocuments(), ProductCategory.countDocuments(),
-      Message.countDocuments(), Message.countDocuments({ status: 'unread' }),
-    ]);
-    const [published, drafts, scheduled] = await Promise.all([
-      Post.countDocuments({ status: 'publicado' }),
-      Post.countDocuments({ status: 'rascunho' }),
-      Post.countDocuments({ status: 'agendado' }),
-    ]);
-    const recentPosts = await Post.find().sort({ createdAt: -1 }).limit(5).populate('category', 'name');
-    res.json({ slides, services, gallery, testimonials, posts, categories, products, productCategories, messages, unreadMessages, published, drafts, scheduled, recentPosts });
-  } catch (err) { apiError(res, err, 500, 'GET /api/admin/stats'); }
-});
-
-
 
 // ──────────────────────────────────────────────
 // SEED ADMIN
@@ -693,7 +615,7 @@ app.delete('/api/admin/posts/:id', auth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
-// PRODUCT CATEGORIES — NOVO
+// PRODUCT CATEGORIES
 // ══════════════════════════════════════════════
 
 app.get('/api/product-categories', async (_req, res) => {
@@ -727,10 +649,9 @@ app.delete('/api/admin/product-categories/:id', auth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
-// PRODUCTS — NOVO
+// PRODUCTS
 // ══════════════════════════════════════════════
 
-// Público: listagem com filtro, pesquisa, paginação
 app.get('/api/products', async (req, res) => {
   try {
     const { cat, q, featured, page = 1, limit = 12 } = req.query;
@@ -748,16 +669,14 @@ app.get('/api/products', async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'GET /api/products'); }
 });
 
-// Público: detalhe por ID ou slug
 app.get('/api/products/:idOrSlug', async (req, res) => {
   try {
     const { idOrSlug } = req.params;
-    const isId  = mongoose.Types.ObjectId.isValid(idOrSlug);
+    const isId    = mongoose.Types.ObjectId.isValid(idOrSlug);
     const product = isId
       ? await Product.findOne({ _id: idOrSlug, active: true }).populate('category', 'name slug')
       : await Product.findOne({ slug: idOrSlug, active: true }).populate('category', 'name slug');
     if (!product) return res.status(404).json({ ok: false, error: 'Produto não encontrado.' });
-    // Produtos relacionados (mesma categoria, excluindo o actual)
     const related = product.category
       ? await Product.find({ category: product.category._id || product.category, _id: { $ne: product._id }, active: true })
           .populate('category', 'name slug').limit(4)
@@ -766,7 +685,6 @@ app.get('/api/products/:idOrSlug', async (req, res) => {
   } catch (err) { apiError(res, err, 500, 'GET /api/products/:idOrSlug'); }
 });
 
-// Admin: listagem completa
 app.get('/api/admin/products', auth, async (req, res) => {
   try {
     const { cat, q, page = 1, limit = 12 } = req.query;
@@ -786,9 +704,7 @@ app.get('/api/admin/products', auth, async (req, res) => {
 app.post('/api/admin/products', auth, body('title').notEmpty(), async (req, res) => {
   if (validate(req, res)) return;
   try {
-    res.status(201).json(
-      await Product.create({ ...req.body, slug: slugify(req.body.title) })
-    );
+    res.status(201).json(await Product.create({ ...req.body, slug: slugify(req.body.title) }));
   } catch (err) { apiError(res, err, 500, 'POST /api/admin/products'); }
 });
 
@@ -806,6 +722,78 @@ app.delete('/api/admin/products/:id', auth, async (req, res) => {
     await Product.findByIdAndDelete(req.params.id);
     res.json({ ok: true });
   } catch (err) { apiError(res, err, 500, 'DELETE /api/admin/products/:id'); }
+});
+
+// ══════════════════════════════════════════════
+// MESSAGES
+// ══════════════════════════════════════════════
+
+// PÚBLICO — receber mensagem do formulário de contacto
+app.post('/api/messages',
+  body('name').notEmpty().withMessage('Nome obrigatório'),
+  body('email').isEmail().withMessage('Email inválido'),
+  body('message').notEmpty().withMessage('Mensagem obrigatória'),
+  async (req, res) => {
+    if (validate(req, res)) return;
+    try {
+      const msg = await Message.create({
+        name:    req.body.name,
+        email:   req.body.email,
+        phone:   req.body.phone   || '',
+        subject: req.body.subject || '',
+        message: req.body.message,
+      });
+      res.status(201).json({ ok: true, id: msg._id });
+    } catch (err) { apiError(res, err, 500, 'POST /api/messages'); }
+  }
+);
+
+// ADMIN — listar mensagens com paginação, pesquisa e filtro
+app.get('/api/admin/messages', auth, async (req, res) => {
+  try {
+    const { q, status, page = 1, limit = 15 } = req.query;
+    const filter = {};
+    if (status === 'unread' || status === 'read') filter.status = status;
+    if (q) filter.$or = [
+      { name:    { $regex: q, $options: 'i' } },
+      { email:   { $regex: q, $options: 'i' } },
+      { subject: { $regex: q, $options: 'i' } },
+      { message: { $regex: q, $options: 'i' } },
+    ];
+    const total    = await Message.countDocuments(filter);
+    const unread   = await Message.countDocuments({ status: 'unread' });
+    const messages = await Message.find(filter)
+      .sort({ createdAt: -1 })
+      .skip((Number(page) - 1) * Number(limit))
+      .limit(Number(limit));
+    res.json({ messages, total, unread, page: Number(page), pages: Math.ceil(total / Number(limit)) });
+  } catch (err) { apiError(res, err, 500, 'GET /api/admin/messages'); }
+});
+
+// ADMIN — detalhe de uma mensagem
+app.get('/api/admin/messages/:id', auth, async (req, res) => {
+  try {
+    const msg = await Message.findById(req.params.id);
+    if (!msg) return res.status(404).json({ ok: false, error: 'Mensagem não encontrada.' });
+    res.json(msg);
+  } catch (err) { apiError(res, err, 500, 'GET /api/admin/messages/:id'); }
+});
+
+// ADMIN — marcar mensagem como lida
+app.patch('/api/admin/messages/:id/read', auth, async (req, res) => {
+  try {
+    const msg = await Message.findByIdAndUpdate(req.params.id, { status: 'read' }, { new: true });
+    if (!msg) return res.status(404).json({ ok: false, error: 'Mensagem não encontrada.' });
+    res.json({ ok: true });
+  } catch (err) { apiError(res, err, 500, 'PATCH /api/admin/messages/:id/read'); }
+});
+
+// ADMIN — eliminar mensagem
+app.delete('/api/admin/messages/:id', auth, async (req, res) => {
+  try {
+    await Message.findByIdAndDelete(req.params.id);
+    res.json({ ok: true });
+  } catch (err) { apiError(res, err, 500, 'DELETE /api/admin/messages/:id'); }
 });
 
 // ══════════════════════════════════════════════
@@ -841,23 +829,46 @@ app.put('/api/admin/profile', auth, async (req, res) => {
 });
 
 // ══════════════════════════════════════════════
-// DASHBOARD STATS
+// DASHBOARD STATS  ← única definição desta rota
 // ══════════════════════════════════════════════
 
 app.get('/api/admin/stats', auth, async (_req, res) => {
   try {
-    const [slides, services, gallery, testimonials, posts, categories, products, productCategories] = await Promise.all([
-      Slide.countDocuments(), Service.countDocuments(), Gallery.countDocuments(),
-      Testimonial.countDocuments(), Post.countDocuments(), Category.countDocuments(),
-      Product.countDocuments(), ProductCategory.countDocuments(),
+    const [
+      slides, services, gallery, testimonials,
+      posts, categories, products, productCategories,
+      messages, unreadMessages,
+    ] = await Promise.all([
+      Slide.countDocuments(),
+      Service.countDocuments(),
+      Gallery.countDocuments(),
+      Testimonial.countDocuments(),
+      Post.countDocuments(),
+      Category.countDocuments(),
+      Product.countDocuments(),
+      ProductCategory.countDocuments(),
+      Message.countDocuments(),
+      Message.countDocuments({ status: 'unread' }),
     ]);
+
     const [published, drafts, scheduled] = await Promise.all([
       Post.countDocuments({ status: 'publicado' }),
       Post.countDocuments({ status: 'rascunho' }),
       Post.countDocuments({ status: 'agendado' }),
     ]);
-    const recentPosts = await Post.find().sort({ createdAt: -1 }).limit(5).populate('category', 'name');
-    res.json({ slides, services, gallery, testimonials, posts, categories, products, productCategories, published, drafts, scheduled, recentPosts });
+
+    const recentPosts = await Post.find()
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .populate('category', 'name');
+
+    res.json({
+      slides, services, gallery, testimonials,
+      posts, categories, products, productCategories,
+      messages, unreadMessages,
+      published, drafts, scheduled,
+      recentPosts,
+    });
   } catch (err) { apiError(res, err, 500, 'GET /api/admin/stats'); }
 });
 
@@ -866,7 +877,10 @@ app.get('/api/admin/stats', auth, async (_req, res) => {
 // ══════════════════════════════════════════════
 
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  const state = mongoose.connection.readyState;
+  // 0=disconnected 1=connected 2=connecting 3=disconnecting
+  const stateMap = { 0: 'disconnected', 1: 'connected', 2: 'connecting', 3: 'disconnecting' };
+  res.json({ status: 'ok', db: stateMap[state] || 'unknown', timestamp: new Date().toISOString() });
 });
 
 // ══════════════════════════════════════════════
@@ -895,6 +909,7 @@ app.listen(PORT, () => {
   console.log(`   GET  /api/product-categories`);
   console.log(`   GET  /api/products`);
   console.log(`   GET  /api/products/:idOrSlug`);
+  console.log(`   POST /api/messages`);
   console.log(`\n  PRIVADAS (Bearer JWT)`);
   console.log(`   POST              /api/auth/login`);
   console.log(`   GET  PUT          /api/auth/me`);
@@ -906,6 +921,7 @@ app.listen(PORT, () => {
   console.log(`   GET  POST PUT DEL /api/admin/posts`);
   console.log(`   GET  POST PUT DEL /api/admin/product-categories`);
   console.log(`   GET  POST PUT DEL /api/admin/products`);
+  console.log(`   GET  DEL PATCH    /api/admin/messages`);
   console.log(`   PUT               /api/admin/contact`);
   console.log(`   PUT               /api/admin/profile`);
   console.log(`   GET               /api/admin/stats`);
